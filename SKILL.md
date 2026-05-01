@@ -65,7 +65,7 @@ metadata:
 PostgreSQL now serves transactional, relational, analytical, AND semantic workloads:
 - **JSONB**: schemaless patterns inside ACID transactions
 - **Full-text search**: native tsvector/tsquery
-- **pgvector**: first-class vector support (cosine distance, product inner, HNSW/IVF indexing)
+- **pgvector**: first-class vector support (cosine distance, inner product / dot product, HNSW/IVF indexing)
 - **TimescaleDB**: hypertables for time-series data
 
 Use **pgvector** as the default vector strategy for teams already operating massive PostgreSQL estates. Eliminates data synchronization overhead with external vector stores.
@@ -96,17 +96,17 @@ Use when: single-region, low-concurrency writes, cost-sensitive, per-tenant isol
 | **pgvector** | PostgreSQL native extension | Teams already on Postgres; ACID semantic + relational in one store |
 | **Pinecone** | Cloud-native, serverless SaaS | Enterprise speed-to-market; zero infrastructure maintenance |
 | **Milvus** | Open-source, Kubernetes-native | Massive-scale similarity search (image search, bioinformatics) |
-| **Weaviate** | Open-source, schema-strict | Multimodal apps combining semantic + lexical search |
-| **Chroma** | Lightweight, local-first | Rapid LLM prototyping, LangChain integration |
+| **Weaviate** | Open-source, schema-flexible with optional strict mode | Multimodal apps combining semantic + lexical search |
+| **Chroma** | Lightweight, embedded or client-server | Rapid LLM prototyping, LangChain integration |
 
 **Key algorithms**: HNSW (probabilistic multilayer graph navigation), IVF (inverted file index), Product Quantization (memory compression).
 
-**Dimensionality tradeoff**: 1536-dim (OpenAI ada-002) for deep semantic accuracy; 384-dim (all-MiniLM-L6-v2) for 4x query speed in latency-sensitive apps.
+**Dimensionality tradeoff**: 1536-dim (OpenAI text-embedding-3-small) for deep semantic accuracy; 384-dim (all-MiniLM-L6-v2) trades semantic depth for significantly lower latency and memory. Actual speedup depends on index parameters — benchmark with your dataset.
 
 ### ORM vs Raw SQL
 
 ```
-Schema-first, complex queries → Raw SQL (psycopg3, asyncpg)
+Schema-first, complex queries → Raw SQL (psycopg3, asyncpg) — MUST use parameterized statements: text("... WHERE id = :id").bindparams(id=user_id)
 Rapid prototyping, teams      → ORM
 Mixed (recommended)           → ORM for CRUD, raw SQL for reports/analytics
 ```
@@ -128,6 +128,8 @@ Mixed (recommended)           → ORM for CRUD, raw SQL for reports/analytics
 
 ```python
 # Repository pattern with SQLAlchemy 2.0
+# WARNING: async sessions should set expire_on_commit=False and return DTOs
+# to avoid DetachedInstanceError when accessing lazy-loaded attributes outside session scope
 class UserRepository:
     def __init__(self, session: AsyncSession):
         self.session = session
@@ -164,7 +166,7 @@ class UserRepository:
 - Offset (`?page=2&limit=20`): simple, but expensive on large datasets (OFFSET scans)
 - Cursor (`?after=eyJpZCI6MTAwfQ`): scalable, consistent under mutations — prefer for feeds and large tables
 
-**Rate Limiting**: token bucket or sliding window. Headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`.
+**Rate Limiting**: token bucket or sliding window. Headers: `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` (IETF standard).
 
 **Webhook Design**:
 ```python
@@ -203,9 +205,9 @@ The BFF pattern provisions a dedicated backend per client experience (iOS, Web, 
 
 **Anti-pattern warning**: BFF must remain spartan. Do NOT absorb domain validations or heavy transactional logic — that creates an accidental integration monolith.
 
-**Best practice**: Write BFF in the same language as its client (often TypeScript/Node.js with Fastify/Hono), host in the same monorepo, and assign ownership to the frontend team. Reserve deep microservice design for pure backend engineers.
+**Best practice**: Write BFF in the same stack as the frontend team (typically TypeScript/Node.js with Fastify/Hono for web clients), host in the same monorepo, and assign ownership to the frontend team. Mobile BFFs (iOS/Android) are usually shared or language-agnostic. Reserve deep microservice design for pure backend engineers.
 
-**Protocol shift**: Modern BFF increasingly moves from passive HTTP request/response to persistent WebSockets and GraphQL mutation subscriptions for real-time state propagation (inventory, stocks, AI reasoning streams).
+**Protocol shift**: Modern BFF increasingly moves from passive HTTP request/response to persistent WebSockets and GraphQL subscriptions for real-time state propagation (inventory, stocks, AI reasoning streams).
 
 ---
 
@@ -221,23 +223,25 @@ Refresh token: long-lived (7–30 days), stored in DB, rotated on use
 **Signing algorithm priority**: EdDSA (Ed25519) > ES256 (ECDSA P-256) > RS256 (RSA 2048) > HS256 (shared secret — avoid for multi-service)
 
 ```python
-# FastAPI JWT pattern
+# FastAPI JWT pattern — HMAC (default, safest for single-service)
 from datetime import datetime, timedelta, UTC
-import jwt  # PyJWT
+import jwt, os
 
-SECRET_KEY = "..."  # from env
-ALGORITHM = "EdDSA"
+SECRET_KEY = os.environ["JWT_SECRET_KEY"]  # 32+ bytes for HS256
+ALGORITHM = "HS256"
 
 def create_access_token(subject: str) -> str:
     expire = datetime.now(UTC) + timedelta(minutes=15)
-    return jwt.encode({"sub": subject, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
+    return jwt.encode({"sub": subject, "exp": expire, "aud": "my-api", "iss": "auth-service"}, SECRET_KEY, algorithm=ALGORITHM)
 
-def create_refresh_token(subject: str) -> str:
+def create_refresh_token(subject: str) -> dict:
     expire = datetime.now(UTC) + timedelta(days=30)
     token = secrets.token_urlsafe(32)
-    # Store hash(token) in DB with user_id + expiry
-    return token
+    # Store hash(token) + expiry in DB
+    return {"token": token, "expires_at": expire.isoformat()}
 ```
+
+**EdDSA (Ed25519) for multi-service**: Requires `PyJWT[crypto]` + `cryptography`. Load PEM key or generate `Ed25519PrivateKey` object. Sign with `jwt.encode(payload, private_key, algorithm="EdDSA")`.
 
 **Refresh token rotation**: invalidate old token on use, issue new pair. Track family for breach detection (if rotated token is reused → family was stolen → revoke all).
 
@@ -245,7 +249,8 @@ def create_refresh_token(subject: str) -> str:
 
 | Scenario | Choice |
 |----------|--------|
-| First-party app (your own users) | JWT (access + refresh) or sessions |
+| First-party app (SPA/mobile) | OAuth2 + PKCE or JWT (access + refresh) |
+| First-party app (web app) | Sessions (Redis store) or JWT |
 | Third-party OAuth (Google, GitHub) | OAuth2 + PKCE (Authorization Code flow) |
 | Machine-to-machine / S2S | API keys (hashed in DB) or client_credentials OAuth2 |
 | Enterprise SSO | SAML or OIDC |
@@ -277,18 +282,18 @@ Use JWTs for: microservices, mobile apps, SPAs, multi-tenant APIs.
 **ABAC** (Attribute-Based): policies evaluate attributes (user, resource, environment). Use for complex multi-tenant or compliance-heavy systems.
 
 ```python
-# FastAPI RBAC dependency
+# FastAPI RBAC dependency — supports multiple roles per user
 from fastapi import Depends, HTTPException, status
 
-def require_role(*roles: str):
+def require_any_role(*roles: str):
     def dependency(current_user: User = Depends(get_current_user)):
-        if current_user.role not in roles:
+        if not any(r in current_user.roles for r in roles):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
         return current_user
     return dependency
 
 # Usage
-@router.delete("/users/{id}", dependencies=[Depends(require_role("admin", "superuser"))])
+@router.delete("/users/{id}", dependencies=[Depends(require_any_role("admin", "superuser"))])
 async def delete_user(id: UUID): ...
 ```
 
@@ -354,7 +359,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE documents (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     content TEXT NOT NULL,
-    embedding VECTOR(1536),  -- OpenAI ada-002 dimensions
+    embedding VECTOR(1536),  -- OpenAI text-embedding-3-small default
     metadata JSONB
 );
 
@@ -364,6 +369,9 @@ USING hnsw (embedding vector_cosine_ops)
 WITH (m = 16, ef_construction = 64);
 
 -- Semantic search query
+-- NOTE: <> returns cosine DISTANCE (0 = identical, 2 = opposite).
+-- For normalized vectors, 1 - distance gives [0,1] similarity.
+-- If vectors aren't normalized, use distance directly and ORDER BY ascending.
 SELECT id, content, 1 - (embedding <=> query_embedding) AS similarity
 FROM documents
 WHERE metadata @> '{"category": "technical"}'
@@ -451,7 +459,7 @@ class PostgresUserRepository(UserRepository):
 
 | Tool | Use When |
 |------|----------|
-| **Redis Streams** | Simple pub/sub, same infra as cache, at-most-once ok |
+| **Redis Streams** | Simple pub/sub, same infra as cache, **at-least-once** via consumer groups and XACK |
 | **NATS** | Lightweight, JetStream for persistence, fast fan-out |
 | **RabbitMQ** | Complex routing, existing AMQP ecosystem |
 | **Kafka** | High throughput, event log, replay, analytics pipeline |
@@ -468,7 +476,7 @@ Rule: start with Redis Streams. Migrate to Kafka when you need replay, audit log
 | **Temporal** | Any | Long-running workflows, sagas, crash-proof execution |
 | **Inngest** | Node.js | Serverless-friendly, event-driven functions |
 
-**Temporal**: Represents a qualitative leap for mission-critical systems. It abstracts state management and retry routing, promising "crash-proof execution" — workflows resume at the exact line of code and precise stack state where interrupted, surviving outages from seconds to months.
+**Temporal**: Represents a qualitative leap for mission-critical systems. It abstracts state management and retry routing, promising "crash-proof execution" — workflows resume via deterministic replay from event history, not by serializing native stack frames. This survives outages from seconds to months.
 
 ```python
 # Dramatiq example (Python)
@@ -502,18 +510,27 @@ E2E / load tests (10%)  — full stack, production-like
 
 ```python
 # pytest + testcontainers for real PostgreSQL
-import pytest
+import pytest, pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy import URL
 
 @pytest.fixture(scope="session")
 def postgres():
-    with PostgresContainer("postgres:16") as pg:
+    with PostgresContainer("postgres:17-alpine") as pg:
         yield pg
 
-@pytest.fixture(scope="session")
+@pytest_asyncio.fixture(scope="session")
 async def engine(postgres):
-    url = postgres.get_connection_url().replace("postgresql://", "postgresql+asyncpg://")
+    # Build URL safely instead of naive string replacement
+    url = URL.create(
+        drivername="postgresql+asyncpg",
+        username=postgres.username,
+        password=postgres.password,
+        host=postgres.get_container_host_ip(),
+        port=postgres.get_exposed_port(5432),
+        database=postgres.dbname,
+    )
     engine = create_async_engine(url)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -527,6 +544,7 @@ Use factories (not fixtures with hardcoded data) to build test objects:
 
 ```python
 # factory-boy example
+from uuid import uuid4
 import factory
 from factory.alchemy import SQLAlchemyModelFactory
 
@@ -630,12 +648,19 @@ async def liveness():
 @app.get("/health/ready")
 async def readiness(db: AsyncSession = Depends(get_db), redis: Redis = Depends(get_redis)):
     """Kubernetes readiness probe — can it serve traffic?"""
+    status = {"status": "ok"}
     try:
         await db.execute(text("SELECT 1"))
+        status["db"] = "ok"
+    except Exception:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    try:
         await redis.ping()
-        return {"status": "ok", "db": "ok", "cache": "ok"}
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        status["cache"] = "ok"
+    except Exception:
+        # Redis is a soft dependency — log but don't fail readiness
+        status["cache"] = "degraded"
+    return status
 ```
 
 ---
